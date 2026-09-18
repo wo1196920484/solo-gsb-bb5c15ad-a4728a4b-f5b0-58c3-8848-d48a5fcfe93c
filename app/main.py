@@ -67,6 +67,53 @@ def _error_response(status_code: int, code: str, message: str, **extra: Any) -> 
     return JSONResponse(status_code=status_code, content={"error": detail})
 
 
+def _json_safe(value: Any) -> Any:
+    """Recursively coerce a value into JSON-encodable form.
+
+    Pydantic error contexts may carry non-JSON values (notably the original
+    exception object raised by a model validator); such values are rendered as
+    stable strings instead of leaking into ``JSONResponse`` and triggering a
+    serialization failure.
+    """
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        # Preserve order: pydantic locations are ordered tuples.
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        try:
+            items = sorted(value, key=lambda item: str(item))
+        except TypeError:
+            items = list(value)
+        return [_json_safe(item) for item in items]
+    # Exceptions and any other non-JSON value: ``str`` gives a stable message
+    # (e.g. ``duplicate subject_id 's1'``) without object identity/addresses.
+    return str(value)
+
+
+def _sanitize_validation_errors(errors: list[Any]) -> list[dict[str, Any]]:
+    """Make Pydantic's error list JSON-safe while keeping its shape.
+
+    Every entry retains ``loc``/``type``/``msg``/``input`` (plus any extra
+    keys such as ``ctx`` or ``url``); non-JSON values nested anywhere inside
+    are recursively turned into stable strings.
+    """
+    sanitized: list[dict[str, Any]] = []
+    for error in errors:
+        if isinstance(error, dict):
+            entry = {str(key): _json_safe(value) for key, value in error.items()}
+        else:
+            entry = {"msg": _json_safe(error)}
+        entry.setdefault("loc", [])
+        entry.setdefault("type", "value_error")
+        entry.setdefault("msg", "Invalid request")
+        entry.setdefault("input", None)
+        sanitized.append(entry)
+    return sanitized
+
+
 @app.exception_handler(ConfigValidationError)
 async def config_validation_handler(request: Request, exc: ConfigValidationError) -> JSONResponse:
     return _error_response(
@@ -83,7 +130,7 @@ async def request_validation_handler(request: Request, exc: RequestValidationErr
         422,
         "invalid_request",
         "request validation failed",
-        errors=exc.errors(),
+        errors=_sanitize_validation_errors(exc.errors()),
     )
 
 

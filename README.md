@@ -400,6 +400,7 @@ curl -s -X POST http://localhost:8000/api/v1/configs \
 | `GET` | `/healthz` | 健康检查 |
 
 错误统一使用信封格式：`{"error": {"code": "...", "message": "...", "errors": [...]}}`。
+请求体校验失败（缺字段、类型错误、`extra` 字段、重复 `subject_id`、超长列表、非法 JSON 等）一律返回 `422 invalid_request`；`errors` 每项保留 `loc`/`type`/`msg`/`input`，`ctx` 中异常等非 JSON 值会被递归转成稳定字符串（例如 `ctx.error = "duplicate subject_id 's-1'"`），重复标识始终出现在 `msg` 中。
 批量判定中个别开关不存在不会使整个请求失败：结果里该开关 `reason=flag_not_found`，同时出现在顶层 `missing_flags` 中。
 
 ---
@@ -413,13 +414,19 @@ pip install -r requirements.txt
 FLAG_DB_PATH=data/flags.db uvicorn app.main:app --reload --port 8000
 ```
 
-核心引擎与校验器只依赖标准库，可直接运行单测（无需安装任何依赖）：
+核心引擎与校验器只依赖标准库，可直接运行单测（无需安装任何依赖；缺少 FastAPI/httpx 时 `tests/test_api_validation.py` 的接口回归会自动跳过）：
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、受众分组的嵌套引用/AND 语义/不匹配落默认/请求内结果复用/悬空引用与循环的防御性求值、分组发布校验（悬空引用、非法引用值、直接与间接循环、分组内未知操作符、错误可定位到分组或规则条件）、SQLite 版本不可变与历史保留、分组定义随版本存储与回显、固定版本重复判定稳定性、版本差异对比与影响传播（边并集、最短路径、字典序平局、并集成环、重复去重）、评估预览（值变化回显双方明细、reason/rule_id 差异忽略、JSON 类型敏感的结构化比较、存在性差异、双版本均缺失、明细按请求排序、按开关汇总、分流按各样本 user_id 计算、分组缓存在“版本 × 样本”内共享且不跨样本复用）、环境指针的创建/更新/revision 自增/过期写入/版本不存在/409 优先于 404/指针快照一致性，以及多线程并发更新下“每个 revision 恰有一个胜者、无丢失更新”。
+如需运行接口回归（`tests/test_api_validation.py`，基于 FastAPI TestClient），在开发环境额外安装 `httpx`：
+
+```bash
+pip install httpx   # 仅测试需要；生产镜像只安装 requirements.txt
+```
+
+测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、受众分组的嵌套引用/AND 语义/不匹配落默认/请求内结果复用/悬空引用与循环的防御性求值、分组发布校验（悬空引用、非法引用值、直接与间接循环、分组内未知操作符、错误可定位到分组或规则条件）、SQLite 版本不可变与历史保留、分组定义随版本存储与回显、固定版本重复判定稳定性、版本差异对比与影响传播（边并集、最短路径、字典序平局、并集成环、重复去重）、评估预览（值变化回显双方明细、reason/rule_id 差异忽略、JSON 类型敏感的结构化比较、存在性差异、双版本均缺失、明细按请求排序、按开关汇总、分流按各样本 user_id 计算、分组缓存在“版本 × 样本”内共享且不跨样本复用）、环境指针的创建/更新/revision 自增/过期写入/版本不存在/409 优先于 404/指针快照一致性，以及多线程并发更新下“每个 revision 恰有一个胜者、无丢失更新”；另有 `tests/test_api_validation.py` 通过 FastAPI TestClient 做接口回归：重复 `subject_id` 返回 422 `invalid_request` 信封（而非 500）、`errors[]` 保留 `loc`/`type`/`msg`/`input` 且 `ctx` 异常被字符串化、普通字段错误（含 `ctx` 数值）、缺失/多余字段与非法 JSON 走同一处理器、版本不存在仍为 404、合法预演仍返回 200。
 
 ## 项目结构
 
@@ -432,7 +439,7 @@ app/
   evaluator.py   纯函数判定引擎（前置、分组递归求值与请求内复用、规则、稳定哈希分流）
   comparison.py  版本对比与反向依赖影响分析（纯函数）
   preview.py     评估预览：两版本 × 样本 × 开关的判定差异（纯函数，分组缓存不跨样本）
-tests/           标准库 unittest 测试
+tests/           标准库 unittest 测试（test_engine.py）+ FastAPI TestClient 接口回归（test_api_validation.py）
 examples/        发布/判定/受众分组/版本对比/评估预览/环境指针/非法配置示例
 Dockerfile, docker-compose.yml
 ```
