@@ -3,6 +3,8 @@
 Run with:  python3 -m unittest discover -s tests -v
 """
 
+import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -23,6 +25,60 @@ from app.comparison import (  # noqa: E402
 from app.evaluator import FlagEvaluator, evaluate_flag, hash_bucket  # noqa: E402
 from app.preview import _json_equal, build_evaluation_preview  # noqa: E402
 from app.validation import ConfigValidationError, validate_config  # noqa: E402
+
+
+class ASGITestClient:
+    """Minimal HTTP-over-ASGI caller (stdlib only).
+
+    Drives the FastAPI app exactly as uvicorn would — routing, dependency
+    parsing and exception handlers included — without third-party test
+    dependencies. An unhandled exception in the app propagates out of the
+    ASGI call (a 500 in real serving), so serialization failures surface as
+    test errors rather than an opaque status code.
+    """
+
+    def __init__(self, asgi_app):
+        self.app = asgi_app
+
+    def request(self, method, path, payload=None):
+        body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+        # ASGI mandates bytes for every header name and value; a str value is
+        # silently mis-decoded by Starlette and the body then fails to parse.
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": method,
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("utf-8"),
+            "query_string": b"",
+            "headers": [
+                (b"host", b"testserver"),
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+            "client": ("testclient", 50000),
+            "server": ("testserver", 80),
+        }
+        chunks = []
+        state = {}
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                state["status"] = message["status"]
+            elif message["type"] == "http.response.body":
+                chunks.append(message.get("body", b""))
+
+        asyncio.run(self.app(scope, receive, send))
+        raw = b"".join(chunks)
+        return state["status"], json.loads(raw.decode("utf-8")) if raw else None
+
+    def post(self, path, payload):
+        return self.request("POST", path, payload)
 
 
 def flag(**kw):
@@ -1236,6 +1292,223 @@ class EnvironmentPointerTests(unittest.TestCase):
         env = db_mod.get_environment(self.conn, "prod")
         self.assertEqual(env["revision"], 3)
         self.assertIn(env["version"], versions)
+
+
+class EvaluationPreviewAPITests(unittest.TestCase):
+    """Interface regression tests for /api/v1/evaluation-previews.
+
+    The duplicate-subject-id check is a whole-body model validator: pydantic
+    stores the raised ValueError inside the error's ``ctx``, which the
+    request-validation handler must serialise into a stable string instead
+    of crashing with a 500.
+    """
+
+    PATH = "/api/v1/evaluation-previews"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["FLAG_DB_PATH"] = os.path.join(self.tmp.name, "test.db")
+        # Imported lazily so importing this module never needs FastAPI; when
+        # the web stack is absent the whole class is skipped.
+        try:
+            from app.main import app
+        except ImportError:  # pragma: no cover - exercised in stdlib-only envs
+            self.skipTest("FastAPI is not installed")
+        conn = db_mod.connect()
+        try:
+            db_mod.init_db(conn)
+            db_mod.insert_version(
+                conn,
+                "v1",
+                {
+                    "flags": {
+                        "flag_a": {
+                            "enabled": True,
+                            "default": False,
+                            "prerequisites": [],
+                            "rules": [
+                                {
+                                    "conditions": [
+                                        {"attr": "tier", "op": "eq", "value": "gold"}
+                                    ],
+                                    "value": True,
+                                }
+                            ],
+                        }
+                    }
+                },
+            )
+            db_mod.insert_version(
+                conn,
+                "v2",
+                {
+                    "flags": {
+                        "flag_a": {
+                            "enabled": True,
+                            "default": True,
+                            "prerequisites": [],
+                            "rules": [],
+                        }
+                    }
+                },
+            )
+        finally:
+            conn.close()
+        self.client = ASGITestClient(app)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        os.environ.pop("FLAG_DB_PATH", None)
+
+    def _payload(self, **overrides):
+        payload = {
+            "from_version": "v1",
+            "to_version": "v2",
+            "flags": ["flag_a"],
+            "subjects": [
+                {"subject_id": "s1", "attributes": {"tier": "gold"}},
+                {"subject_id": "s2", "attributes": {"tier": "silver"}},
+            ],
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_duplicate_subject_id_returns_422_envelope(self):
+        payload = self._payload(
+            subjects=[
+                {"subject_id": "s1", "attributes": {"tier": "gold"}},
+                {"subject_id": "s1", "attributes": {"tier": "silver"}},
+            ]
+        )
+        status, body = self.client.post(self.PATH, payload)
+
+        self.assertEqual(status, 422)
+        self.assertEqual(
+            body["error"]["code"],
+            "invalid_request",
+            f"expected invalid_request envelope, got: {body}",
+        )
+        self.assertIn("message", body["error"])
+        (error,) = body["error"]["errors"]
+
+        # Every standard pydantic field survives the envelope...
+        self.assertEqual(error["loc"], ["body"])
+        self.assertEqual(error["type"], "value_error")
+        self.assertIn("input", error)
+        self.assertEqual(error["input"], payload)
+        # ...and the duplicated identifier stays visible in the message.
+        self.assertIn("duplicate subject_id", error["msg"])
+        self.assertIn("'s1'", error["msg"])
+
+        # The ctx exception is rendered as a stable JSON string (not an
+        # object, not dropped): json.loads of the wire body already proved
+        # serializability; assert the content explicitly.
+        self.assertEqual(error["ctx"], {"error": "duplicate subject_id 's1'"})
+
+        # The whole envelope must be deterministically JSON-serialisable.
+        encoded = json.dumps(body)
+        self.assertEqual(json.loads(encoded), body)
+
+    def test_duplicate_subject_id_among_three_subjects(self):
+        payload = self._payload(
+            subjects=[
+                {"subject_id": "s1"},
+                {"subject_id": "s2"},
+                {"subject_id": "s2"},
+            ]
+        )
+        status, body = self.client.post(self.PATH, payload)
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "invalid_request")
+        (error,) = body["error"]["errors"]
+        self.assertIn("'s2'", error["msg"])
+        self.assertEqual(error["ctx"]["error"], "duplicate subject_id 's2'")
+
+    def test_ordinary_field_errors_keep_loc_type_msg_input(self):
+        # A mix of ordinary (non-model-validator) constraint failures.
+        payload = {
+            "from_version": "",  # string_too_short
+            "to_version": "v2",
+            "flags": [],  # too_short
+            "subjects": [
+                {"subject_id": "s1", "unexpected": 1},  # extra_forbidden
+            ],
+            "unknown_top": True,  # extra_forbidden
+        }
+        status, body = self.client.post(self.PATH, payload)
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "invalid_request")
+
+        errors = body["error"]["errors"]
+        # loc -> expected error type mapping (order is pydantic's stable order).
+        by_loc = {tuple(err["loc"]): err for err in errors}
+        self.assertEqual(
+            by_loc[("body", "from_version")]["type"], "string_too_short"
+        )
+        self.assertEqual(by_loc[("body", "flags")]["type"], "too_short")
+        self.assertEqual(
+            by_loc[("body", "subjects", 0, "unexpected")]["type"],
+            "extra_forbidden",
+        )
+        self.assertEqual(
+            by_loc[("body", "unknown_top")]["type"], "extra_forbidden"
+        )
+
+        for err in errors:
+            # All four required keys present and non-empty.
+            self.assertIn("loc", err)
+            self.assertTrue(err["loc"])
+            self.assertIn("type", err)
+            self.assertTrue(err["type"])
+            self.assertIn("msg", err)
+            self.assertTrue(err["msg"])
+            self.assertIn("input", err)
+
+        # Inputs are echoed verbatim by the envelope.
+        self.assertEqual(by_loc[("body", "from_version")]["input"], "")
+        self.assertEqual(by_loc[("body", "flags")]["input"], [])
+        self.assertEqual(
+            by_loc[("body", "subjects", 0, "unexpected")]["input"], 1
+        )
+        # Ordinary ctx values (min_length, actual_length, ...) survive intact.
+        self.assertEqual(by_loc[("body", "from_version")]["ctx"]["min_length"], 1)
+        self.assertEqual(by_loc[("body", "flags")]["ctx"]["actual_length"], 0)
+
+    def test_missing_versions_still_returns_404(self):
+        # Duplicate-subject handling must run after version resolution; with
+        # unique subjects, a missing version keeps its plain 404 envelope.
+        payload = self._payload(to_version="ghost")
+        status, body = self.client.post(self.PATH, payload)
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "version_not_found")
+        self.assertIn("ghost", body["error"]["message"])
+
+        payload = self._payload(from_version="ghost", to_version="v2")
+        status, body = self.client.post(self.PATH, payload)
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "version_not_found")
+
+    def test_valid_preview_still_succeeds(self):
+        payload = self._payload(
+            subjects=[
+                # s1 hits the v1 rule (True); v2 default True -> unchanged.
+                {"subject_id": "s1", "attributes": {"tier": "gold"}},
+                # s2 misses the v1 rule (False); v2 default True -> changed.
+                {"subject_id": "s2", "attributes": {"tier": "silver"}},
+            ]
+        )
+        status, body = self.client.post(self.PATH, payload)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["from_version"], "v1")
+        self.assertEqual(body["to_version"], "v2")
+        self.assertEqual(
+            [(c["subject_id"], c["flag"]) for c in body["changed"]],
+            [("s2", "flag_a")],
+        )
+        self.assertEqual(
+            body["summary"],
+            [{"flag": "flag_a", "changed": 1, "unchanged": 1}],
+        )
 
 
 if __name__ == "__main__":

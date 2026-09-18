@@ -67,6 +67,29 @@ def _error_response(status_code: int, code: str, message: str, **extra: Any) -> 
     return JSONResponse(status_code=status_code, content={"error": detail})
 
 
+def _json_safe(value: Any) -> Any:
+    """Coerce a validation-error fragment into JSON-serialisable data.
+
+    Pydantic's error dicts are JSON-safe for ordinary field constraints, but
+    a model validator that raises (e.g. the unique-subject-id check) lands in
+    ``ctx`` as the original exception object, which ``json.dumps`` rejects.
+    Containers are walked recursively; tuples (used for ``loc``) become
+    lists; every other non-JSON value is rendered with ``str()`` so the
+    message it carries — such as the duplicated identifier — survives.
+    """
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, BaseException):
+        # ``str(exc)`` is a stable, repeatable rendering (no repr or memory
+        # addresses), and it keeps the validator's message intact.
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
 @app.exception_handler(ConfigValidationError)
 async def config_validation_handler(request: Request, exc: ConfigValidationError) -> JSONResponse:
     return _error_response(
@@ -83,7 +106,7 @@ async def request_validation_handler(request: Request, exc: RequestValidationErr
         422,
         "invalid_request",
         "request validation failed",
-        errors=exc.errors(),
+        errors=[_json_safe(error) for error in exc.errors()],
     )
 
 
